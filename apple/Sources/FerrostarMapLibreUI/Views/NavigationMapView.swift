@@ -23,6 +23,9 @@ public struct NavigationMapView: View {
     var onUserTrackingModeChanged: (MLNUserTrackingMode, Bool) -> Void
     let userLayers: [StyleLayerDefinition]
     let activity: MapActivity
+    private let followCameraConfiguration: NavigationFollowCameraConfiguration?
+    private let automaticallyAdjustsFollowZoom: Bool
+    @State private var maneuverCamera = NavigationManeuverCamera()
 
     // TODO: Configurable camera and user "puck" rotation modes
 
@@ -43,6 +46,9 @@ public struct NavigationMapView: View {
     ///   - navigationState: The current ferrostar navigation state provided by ferrostar core.
     ///   - locationManagerConfiguration: Optional custom managers for navigating/non-navigating modes.
     ///     Keep manager instances stable (do not construct inline in `body`).
+    ///   - followCameraConfiguration: Opt in to route-aware course following with the given settings.
+    ///     Pass nil to use the map's built-in follow camera.
+    ///   - automaticallyAdjustsFollowZoom: Use route progress to adjust zoom in the route-aware camera.
     ///   - onStyleLoaded: The map's style has loaded and the camera can be manipulated (e.g. to user tracking).
     ///   - makeMapContent: Custom maplibre symbols to display on the map view.
     public init(
@@ -51,6 +57,8 @@ public struct NavigationMapView: View {
         navigationState: NavigationState?,
         locationManagerConfiguration: NavigationLocationManagerConfiguration? = nil,
         activity: MapActivity = .standard,
+        followCameraConfiguration: NavigationFollowCameraConfiguration? = nil,
+        automaticallyAdjustsFollowZoom: Bool = true,
         onUserTrackingModeChanged: @escaping (MLNUserTrackingMode, Bool) -> Void = { _, _ in },
         onStyleLoaded: @escaping ((MLNStyle) -> Void),
         @MapViewContentBuilder _ makeMapContent: () -> [StyleLayerDefinition] = { [] }
@@ -63,11 +71,14 @@ public struct NavigationMapView: View {
         self.onStyleLoaded = onStyleLoaded
         userLayers = makeMapContent()
         self.activity = activity
+        self.followCameraConfiguration = followCameraConfiguration
+        self.automaticallyAdjustsFollowZoom = automaticallyAdjustsFollowZoom
     }
 
     public var body: some View {
         GeometryReader { geometry in
             MapView(
+                makeViewController: makeMapController(),
                 styleURL: styleURL,
                 camera: $camera,
                 locationManager: activeLocationManager,
@@ -85,10 +96,27 @@ public struct NavigationMapView: View {
             .mapControls {
                 // No controls
             }
+            .mapCameraDisabled(ownsFollowCamera)
             .onMapUserTrackingModeChanged(onUserTrackingModeChanged)
-            .onMapStyleLoaded(onStyleLoaded)
+            .onMapStyleLoaded { style in
+                onStyleLoaded(style)
+                maneuverCamera.applyLatestUpdate(locationManager: activeNavigatingLocationManager)
+            }
+            .onChange(of: followCameraUpdate) { update in
+                maneuverCamera.update(update, locationManager: activeNavigatingLocationManager)
+            }
+            .onAppear {
+                maneuverCamera.update(followCameraUpdate, locationManager: activeNavigatingLocationManager)
+            }
+            .onDisappear { maneuverCamera.stop() }
             .ignoresSafeArea(.all)
         }
+    }
+
+    private func makeMapController() -> MLNMapViewController {
+        let controller = MLNMapViewController(initialStyleURL: styleURL, activity: activity)
+        maneuverCamera.attach(to: controller.mapView)
+        return controller
     }
 
     private func calculatedMapViewInsets(for geometry: GeometryProxy) -> NavigationMapViewContentInsetMode {
@@ -118,7 +146,46 @@ public struct NavigationMapView: View {
         }
     }
 
+    private var ownsFollowCamera: Bool {
+        followCameraConfiguration != nil && navigationState?.isNavigating == true &&
+            camera.isTrackingUserLocationWithCourse
+    }
+
+    private var followCameraUpdate: NavigationManeuverCamera.Update? {
+        guard ownsFollowCamera, let followCameraConfiguration,
+              let navigationState, let userLocation = navigationState.preferredUserLocation,
+              case let .trackingUserLocationWithCourse(zoom, pitch, _) = camera.state
+        else { return nil }
+
+        let progress: NavigationManeuverCamera.RouteProgress?
+        if navigationState.currentDeviation == .noDeviation, !navigationState.isCalculatingNewRoute,
+           let steps = navigationState.remainingSteps,
+           let distance = navigationState.currentProgress?.distanceToNextManeuver,
+           distance.isFinite, distance >= 0 {
+            let nextTurn: NavigationManeuverCamera.RouteProgress.Turn?
+            if let coordinate = steps.dropFirst().first?.geometry.first?.clLocationCoordinate2D,
+               CLLocationCoordinate2DIsValid(coordinate) {
+                nextTurn = .init(coordinate: coordinate)
+            } else {
+                nextTurn = nil
+            }
+            progress = .init(remainingStepCount: steps.count, distanceToTurn: distance, nextTurn: nextTurn)
+        } else {
+            progress = nil
+        }
+
+        return .init(
+            location: userLocation.clLocation,
+            followZoom: zoom,
+            pitch: pitch,
+            automaticallyAdjustsZoom: automaticallyAdjustsFollowZoom,
+            configuration: followCameraConfiguration,
+            progress: progress
+        )
+    }
+
     private func updateCameraIfNeeded() {
+        guard !ownsFollowCamera else { return }
         if let userLocation = navigationState?.preferredUserLocation,
            // There is no reason to push an update if the coordinate and heading are the same.
            // That's all that gets displayed, so it's all that MapLibre should care about.
@@ -153,6 +220,20 @@ public struct NavigationMapView: View {
         styleURL: URL(string: "https://demotiles.maplibre.org/style.json")!,
         camera: .constant(.center(userLocation.clLocation.coordinate, zoom: 12)),
         navigationState: state,
+        onStyleLoaded: { _ in }
+    )
+}
+
+#Preview("Route-Aware Follow Camera") {
+    NavigationMapView(
+        styleURL: URL(string: "https://demotiles.maplibre.org/style.json")!,
+        camera: .constant(.automotiveNavigation()),
+        navigationState: NavigationState.modifiedPedestrianExample(droppingNWaypoints: 4),
+        followCameraConfiguration: .init(
+            zoomRange: 13...18,
+            maneuverPadding: .init(top: 12, left: 12, bottom: 12, right: 12),
+            maneuverPitch: .init(distanceRange: 30...100, cruisingPitch: 40)
+        ),
         onStyleLoaded: { _ in }
     )
 }
