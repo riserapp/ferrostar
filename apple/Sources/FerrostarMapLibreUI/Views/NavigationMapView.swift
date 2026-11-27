@@ -196,7 +196,9 @@ public struct NavigationMapView: View {
               case let .trackingUserLocationWithCourse(zoom, pitch, _) = camera.state
         else { return nil }
 
-        let location = followCameraLocation(from: userLocation.clLocation)
+        let routeLocation = userLocation.clLocation
+        let puckLocation = preparedPuckLocation(for: routeLocation)
+        let location = followCameraLocation(from: routeLocation, using: puckLocation)
         let progress: NavigationManeuverCamera.RouteProgress?
         if navigationState.currentDeviation == .noDeviation, !navigationState.isCalculatingNewRoute,
            let steps = navigationState.remainingSteps,
@@ -255,6 +257,7 @@ public struct NavigationMapView: View {
 
         return .init(
             location: location,
+            preparedPuckLocation: puckLocation,
             followZoom: zoom,
             pitch: pitch,
             automaticallyAdjustsZoom: automaticallyAdjustsFollowZoom,
@@ -263,11 +266,18 @@ public struct NavigationMapView: View {
         )
     }
 
-    private func followCameraLocation(from location: CLLocation) -> CLLocation {
-        guard navigationStateUpdates != nil, !location.course.isFinite || location.course < 0 else { return location }
-        let puckLocation = activeNavigatingLocationManager.lastLocation
+    private func preparedPuckLocation(for location: CLLocation) -> CLLocation? {
+        guard let prepared = activeNavigatingLocationManager.preparedNavigationLocation,
+              prepared.timestamp == location.timestamp, prepared.coordinate == location.coordinate else { return nil }
+        return prepared
+    }
+
+    private func followCameraLocation(from location: CLLocation, using preparedPuckLocation: CLLocation?) -> CLLocation {
+        guard !location.course.isFinite || location.course < 0 else { return location }
+        let deliveredPuckLocation = navigationStateUpdates == nil ? nil : activeNavigatingLocationManager.lastLocation
         // Reuse a course fallback the host supplied for this exact fix.
-        guard puckLocation.course.isFinite, puckLocation.course >= 0, puckLocation.timestamp == location.timestamp,
+        guard let puckLocation = preparedPuckLocation ?? deliveredPuckLocation,
+              puckLocation.course.isFinite, puckLocation.course >= 0, puckLocation.timestamp == location.timestamp,
               puckLocation.coordinate == location.coordinate else { return location }
         if puckLocation.speed == location.speed {
             return puckLocation
@@ -437,14 +447,13 @@ public struct NavigationMapView: View {
     }
 
     private func updateCameraIfNeeded() {
-        guard !ownsFollowCamera else { return }
-        if let userLocation = navigationState?.preferredUserLocation,
-           // There is no reason to push an update if the coordinate and heading are the same.
-           // That's all that gets displayed, so it's all that MapLibre should care about.
-           activeNavigatingLocationManager.lastLocation.coordinate != userLocation.coordinates.clLocationCoordinate2D ||
-           activeNavigatingLocationManager.lastLocation.course != userLocation.clLocation.course
-        {
-            activeNavigatingLocationManager.lastLocation = userLocation.clLocation
+        guard !ownsFollowCamera, let routeLocation = navigationState?.preferredUserLocation?.clLocation else { return }
+        let locationManager = activeNavigatingLocationManager
+        let location = preparedPuckLocation(for: routeLocation) ?? routeLocation
+        // The puck shows only the coordinate and heading.
+        if locationManager.lastLocation.coordinate != location.coordinate ||
+            locationManager.lastLocation.course != location.course {
+            locationManager.lastLocation = location
         }
     }
 

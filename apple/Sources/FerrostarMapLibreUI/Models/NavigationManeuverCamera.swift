@@ -119,6 +119,7 @@ final class NavigationManeuverCamera {
 
     struct Update: Equatable {
         let location: CLLocation
+        let preparedPuckLocation: CLLocation?
         let followZoom: Double
         let pitch: Double
         let automaticallyAdjustsZoom: Bool
@@ -245,12 +246,13 @@ final class NavigationManeuverCamera {
         guard elapsed > 0 || settingsChanged || viewportChanged else { return }
 
         let lastLocation = locationManager.lastLocation
-        let hasNewPosition = lastLocation.coordinate.latitude != update.location.coordinate.latitude ||
-            lastLocation.coordinate.longitude != update.location.coordinate.longitude ||
-            lastLocation.course != update.location.course
+        let puckLocation = update.preparedPuckLocation ?? update.location
+        let hasNewPosition = lastLocation.coordinate.latitude != puckLocation.coordinate.latitude ||
+            lastLocation.coordinate.longitude != puckLocation.coordinate.longitude ||
+            lastLocation.course != puckLocation.course
 
         if map.gestureRecognizers?.contains(where: { $0.state == .began || $0.state == .changed }) == true {
-            if hasNewPosition { locationManager.lastLocation = update.location }
+            if hasNewPosition { locationManager.lastLocation = puckLocation }
             return
         }
 
@@ -370,7 +372,7 @@ final class NavigationManeuverCamera {
         }
         pose.altitude = MLNAltitudeForZoomLevel(zoom, pose.pitch, pose.centerCoordinate.latitude, map.bounds.size)
         if hasNewPosition {
-            locationManager.lastLocation = update.location
+            locationManager.lastLocation = puckLocation
         }
         if configuration.showsCourseArrow {
             updateCourseArrow(on: map, course: update.location.course, heading: pose.heading, duration: duration)
