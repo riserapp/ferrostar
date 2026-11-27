@@ -49,6 +49,30 @@ public struct NavigationFollowCameraConfiguration: Equatable {
         }
     }
 
+    public struct ManeuverFraming: Equatable {
+        let distanceRange: ClosedRange<CLLocationDistance>
+        let outgoingDistance: CLLocationDistance
+        let viewportPadding: CGFloat
+        let compoundManeuverDistance: CLLocationDistance?
+
+        /// Fully frame the nearby maneuver at the lower bound, fading to rider-centered
+        /// framing by the upper bound. Include up to outgoingDistance meters after the turn.
+        /// Reserve viewportPadding points around the fitted area for the marker and route line.
+        /// Set compoundManeuverDistance to frame two maneuvers together when their route separation
+        /// is within that many meters. By default, the camera frames only the next maneuver.
+        public init(
+            distanceRange: ClosedRange<CLLocationDistance>,
+            outgoingDistance: CLLocationDistance,
+            viewportPadding: CGFloat = 0,
+            compoundManeuverDistance: CLLocationDistance? = nil
+        ) {
+            self.distanceRange = distanceRange
+            self.outgoingDistance = max(0, outgoingDistance)
+            self.viewportPadding = max(0, viewportPadding)
+            self.compoundManeuverDistance = compoundManeuverDistance
+        }
+    }
+
     let zoomRange: ClosedRange<Double>
     let speedZoomBands: [SpeedZoomBand]
     let maneuverPadding: UIEdgeInsets
@@ -60,6 +84,7 @@ public struct NavigationFollowCameraConfiguration: Equatable {
     let maximumHeadingDegreesPerSecond: Double
     let maximumPitchDegreesPerSecond: Double
     let showsCourseArrow: Bool
+    let maneuverFraming: ManeuverFraming?
 
     /// Creates a configuration for fitting the location and next maneuver in the viewport.
     ///
@@ -76,6 +101,7 @@ public struct NavigationFollowCameraConfiguration: Equatable {
     ///   - maximumHeadingDegreesPerSecond: Maximum turn rate of the camera.
     ///   - maximumPitchDegreesPerSecond: Maximum tilt rate of the camera.
     ///   - showsCourseArrow: Draw a course arrow on the MapLibre location marker while following.
+    ///   - maneuverFraming: Optionally center the rider and a nearby maneuver together.
     public init(
         zoomRange: ClosedRange<Double> = 0...22,
         speedZoomBands: [SpeedZoomBand] = [],
@@ -87,7 +113,8 @@ public struct NavigationFollowCameraConfiguration: Equatable {
         maneuverPitch: ManeuverPitch? = nil,
         maximumHeadingDegreesPerSecond: Double = 90,
         maximumPitchDegreesPerSecond: Double = 45,
-        showsCourseArrow: Bool = true
+        showsCourseArrow: Bool = true,
+        maneuverFraming: ManeuverFraming? = nil
     ) {
         self.zoomRange = zoomRange
         self.speedZoomBands = speedZoomBands.sorted { $0.speedBelow < $1.speedBelow }
@@ -100,6 +127,7 @@ public struct NavigationFollowCameraConfiguration: Equatable {
         self.maximumHeadingDegreesPerSecond = max(0, maximumHeadingDegreesPerSecond)
         self.maximumPitchDegreesPerSecond = max(0, maximumPitchDegreesPerSecond)
         self.showsCourseArrow = showsCourseArrow
+        self.maneuverFraming = maneuverFraming
     }
 
     func minimumZoom(for speed: CLLocationSpeed) -> Double {

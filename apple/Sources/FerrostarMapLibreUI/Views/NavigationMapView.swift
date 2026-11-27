@@ -1,4 +1,5 @@
 import FerrostarCore
+import struct FerrostarCoreFFI.RouteStep
 import FerrostarSwiftUI
 import MapKit
 import MapLibre
@@ -77,6 +78,9 @@ public struct NavigationMapView: View {
 
     public var body: some View {
         GeometryReader { geometry in
+            let viewport = NavigationManeuverCamera.Viewport(
+                size: geometry.size, insets: calculatedMapViewInsets(for: geometry).uiEdgeInsets
+            )
             MapView(
                 makeViewController: makeMapController(),
                 styleURL: styleURL,
@@ -92,7 +96,7 @@ public struct NavigationMapView: View {
                 // Overlay any additional user layers.
                 userLayers
             }
-            .mapContentInset(calculatedMapViewInsets(for: geometry).uiEdgeInsets)
+            .mapContentInset(viewport.insets)
             .mapControls {
                 // No controls
             }
@@ -104,6 +108,13 @@ public struct NavigationMapView: View {
             }
             .onChange(of: followCameraUpdate) { update in
                 maneuverCamera.update(update, locationManager: activeNavigatingLocationManager)
+            }
+            .onChange(of: viewport) { _ in
+                guard ownsFollowCamera, followCameraConfiguration?.maneuverFraming != nil else { return }
+                // Wait for the map representable to apply the new bounds and insets.
+                Task { @MainActor in
+                    maneuverCamera.applyLatestUpdate(locationManager: activeNavigatingLocationManager)
+                }
             }
             .onAppear {
                 maneuverCamera.update(followCameraUpdate, locationManager: activeNavigatingLocationManager)
@@ -162,14 +173,32 @@ public struct NavigationMapView: View {
            let steps = navigationState.remainingSteps,
            let distance = navigationState.currentProgress?.distanceToNextManeuver,
            distance.isFinite, distance >= 0 {
-            let nextTurn: NavigationManeuverCamera.RouteProgress.Turn?
-            if let coordinate = steps.dropFirst().first?.geometry.first?.clLocationCoordinate2D,
-               CLLocationCoordinate2DIsValid(coordinate) {
-                nextTurn = .init(coordinate: coordinate)
+            let outgoingStep = steps.dropFirst().first
+            let nextTurn = (outgoingStep?.geometry.first?.clLocationCoordinate2D)
+                .flatMap(NavigationManeuverCamera.RouteProgress.Turn.init(validating:))
+            let outgoingPath: [NavigationManeuverCamera.RouteProgress.Turn]
+            let compoundManeuvers: NavigationManeuverCamera.RouteProgress.CompoundManeuvers?
+            if let framing = followCameraConfiguration.maneuverFraming, let outgoingStep, let nextTurn,
+               automaticallyAdjustsFollowZoom, distance < framing.distanceRange.upperBound {
+                outgoingPath = NavigationManeuverCamera.outgoingPath(
+                    from: nextTurn,
+                    through: outgoingStep.geometry.dropFirst().lazy.map(\.clLocationCoordinate2D),
+                    distance: framing.outgoingDistance
+                )
+                compoundManeuvers = makeCompoundManeuvers(
+                    in: steps, from: nextTurn, outgoingStep: outgoingStep, framing: framing
+                )
             } else {
-                nextTurn = nil
+                outgoingPath = []
+                compoundManeuvers = nil
             }
-            progress = .init(remainingStepCount: steps.count, distanceToTurn: distance, nextTurn: nextTurn)
+            progress = .init(
+                remainingStepCount: steps.count,
+                distanceToTurn: distance,
+                nextTurn: nextTurn,
+                outgoingPath: outgoingPath,
+                compoundManeuvers: compoundManeuvers
+            )
         } else {
             progress = nil
         }
@@ -181,6 +210,38 @@ public struct NavigationMapView: View {
             automaticallyAdjustsZoom: automaticallyAdjustsFollowZoom,
             configuration: followCameraConfiguration,
             progress: progress
+        )
+    }
+
+    private func makeCompoundManeuvers(
+        in steps: [RouteStep],
+        from firstTurn: NavigationManeuverCamera.RouteProgress.Turn,
+        outgoingStep: RouteStep,
+        framing: NavigationFollowCameraConfiguration.ManeuverFraming
+    ) -> NavigationManeuverCamera.RouteProgress.CompoundManeuvers? {
+        typealias Turn = NavigationManeuverCamera.RouteProgress.Turn
+        guard let maximumSeparation = framing.compoundManeuverDistance,
+              outgoingStep.distance > 0, outgoingStep.distance <= maximumSeparation,
+              let nextStep = steps.dropFirst(2).first, nextStep.geometry.count > 1,
+              let secondStart = nextStep.geometry.first?.clLocationCoordinate2D,
+              let secondTurn = Turn(validating: secondStart),
+              let firstEnd = outgoingStep.geometry.last?.clLocationCoordinate2D,
+              CLLocationCoordinate2DIsValid(firstEnd),
+              CLLocation(latitude: firstEnd.latitude, longitude: firstEnd.longitude)
+                .distance(from: CLLocation(latitude: secondStart.latitude, longitude: secondStart.longitude)) <= 10
+        else { return nil }
+
+        let pathBetweenTurns = outgoingStep.geometry.compactMap { Turn(validating: $0.clLocationCoordinate2D) }
+        let outgoingPath = NavigationManeuverCamera.outgoingPath(
+            from: secondTurn,
+            through: nextStep.geometry.dropFirst().lazy.map(\.clLocationCoordinate2D),
+            distance: framing.outgoingDistance
+        )
+        return .init(
+            first: firstTurn,
+            second: secondTurn,
+            stepCountBeforeFirst: steps.count,
+            path: pathBetweenTurns + [secondTurn] + outgoingPath
         )
     }
 

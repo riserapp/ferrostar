@@ -15,11 +15,38 @@ final class NavigationManeuverCamera {
                 latitude = coordinate.latitude
                 longitude = coordinate.longitude
             }
+
+            init?(validating coordinate: CLLocationCoordinate2D) {
+                guard CLLocationCoordinate2DIsValid(coordinate) else { return nil }
+                self.init(coordinate: coordinate)
+            }
+
+            var coordinate: CLLocationCoordinate2D {
+                .init(latitude: latitude, longitude: longitude)
+            }
+        }
+
+        struct CompoundManeuvers: Equatable {
+            let first: Turn
+            let second: Turn
+            let stepCountBeforeFirst: Int
+            let path: [Turn]
+
+            func containsNextTurn(in progress: RouteProgress) -> Bool {
+                (progress.remainingStepCount == stepCountBeforeFirst && progress.nextTurn == first) ||
+                    isApproachingSecond(in: progress)
+            }
+
+            func isApproachingSecond(in progress: RouteProgress) -> Bool {
+                progress.remainingStepCount == stepCountBeforeFirst - 1 && progress.nextTurn == second
+            }
         }
 
         let remainingStepCount: Int
         let distanceToTurn: CLLocationDistance
         let nextTurn: Turn?
+        let outgoingPath: [Turn]
+        let compoundManeuvers: CompoundManeuvers?
     }
 
     struct Update: Equatable {
@@ -31,12 +58,48 @@ final class NavigationManeuverCamera {
         let progress: RouteProgress?
     }
 
+    struct Viewport: Equatable {
+        let size: CGSize
+        let insets: UIEdgeInsets
+    }
+
     private weak var map: MLNMapView?
     private var latestUpdate: Update?
     private var lastAppliedUpdate: Update?
+    private var lastAppliedViewport: Viewport?
     private var previousProgress: RouteProgress?
     private var closeTurnZoom: Double?
+    private var compoundManeuvers: RouteProgress.CompoundManeuvers?
     private var courseArrow: CAShapeLayer?
+
+    static func outgoingPath(
+        from turn: RouteProgress.Turn,
+        through coordinates: some Sequence<CLLocationCoordinate2D>,
+        distance: CLLocationDistance
+    ) -> [RouteProgress.Turn] {
+        guard distance > 0 else { return [] }
+        var path: [RouteProgress.Turn] = []
+        var previous = turn
+        var previousLocation = CLLocation(latitude: turn.latitude, longitude: turn.longitude)
+        var remaining = distance
+        for coordinate in coordinates {
+            guard let point = RouteProgress.Turn(validating: coordinate) else { break }
+            let location = CLLocation(latitude: point.latitude, longitude: point.longitude)
+            let segment = location.distance(from: previousLocation)
+            guard segment.isFinite, segment > 0 else { continue }
+            if segment >= remaining {
+                path.append(.init(coordinate: interpolatedCoordinate(
+                    from: previous.coordinate, to: point.coordinate, fraction: remaining / segment
+                )))
+                break
+            }
+            path.append(point)
+            remaining -= segment
+            previous = point
+            previousLocation = location
+        }
+        return path
+    }
 
     private func makeCourseArrow() -> CAShapeLayer {
         let arrow = CAShapeLayer()
@@ -65,8 +128,10 @@ final class NavigationManeuverCamera {
         courseArrow?.removeAllAnimations()
         latestUpdate = nil
         lastAppliedUpdate = nil
+        lastAppliedViewport = nil
         previousProgress = nil
         closeTurnZoom = nil
+        compoundManeuvers = nil
     }
 
     func update(_ update: Update?, locationManager: any NavigationDrivenLocationManager) {
@@ -90,13 +155,15 @@ final class NavigationManeuverCamera {
         let previous = lastAppliedUpdate
         let configuration = update.configuration
         let configurationChanged = previous?.configuration != configuration
+        let viewport = Viewport(size: map.bounds.size, insets: map.contentInset)
+        let viewportChanged = configuration.maneuverFraming != nil && lastAppliedViewport != viewport
         let elapsed = previous.map { update.location.timestamp.timeIntervalSince($0.location.timestamp) } ?? 0
         let settingsChanged = previous.map {
             $0.followZoom != update.followZoom || $0.pitch != update.pitch ||
                 $0.automaticallyAdjustsZoom != update.automaticallyAdjustsZoom || configurationChanged
         } ?? true
         // Route metadata can change without a new fix. Keep it for the next transition.
-        guard elapsed > 0 || settingsChanged else { return }
+        guard elapsed > 0 || settingsChanged || viewportChanged else { return }
 
         let lastLocation = locationManager.lastLocation
         let hasNewPosition = lastLocation.coordinate.latitude != update.location.coordinate.latitude ||
@@ -111,30 +178,19 @@ final class NavigationManeuverCamera {
         if configurationChanged {
             previousProgress = nil
             closeTurnZoom = nil
+            compoundManeuvers = nil
         }
         lastAppliedUpdate = update
+        lastAppliedViewport = viewport
         let puckInterval = update.location.timestamp.timeIntervalSince(lastLocation.timestamp)
         let interval = hasNewPosition && puckInterval > 0 ? puckInterval : elapsed
         // Keep center, bearing, pitch and zoom on the measured location cadence.
         let duration = interval > 0 ? min(1, max(0.15, interval)) : 0.45
-        let desiredZoom = min(map.maximumZoomLevel, max(map.minimumZoomLevel, targetZoom(for: update, on: map)))
-        let currentZoom = map.zoomLevel
-        let zoomDelta = desiredZoom - currentZoom
-        let zoom: Double
-        if update.automaticallyAdjustsZoom, abs(zoomDelta) <= configuration.zoomDeadband {
-            zoom = currentZoom
-        } else if update.automaticallyAdjustsZoom {
-            // The next maneuver can be much farther away on the first fix after a turn.
-            let transition = zoomDelta < 0 ? configuration.zoomOut : configuration.zoomIn
-            let response = 1 - exp(-duration / transition.responseTime)
-            zoom = limitedMove(
-                from: currentZoom,
-                toward: currentZoom + zoomDelta * response,
-                maximumChange: transition.maximumLevelsPerSecond * duration
-            )
-        } else {
-            zoom = desiredZoom
-        }
+        let rider = update.location.coordinate
+        let nextTurn = update.progress?.nextTurn.map { [$0] } ?? []
+        let baseFit = update.automaticallyAdjustsZoom
+            ? cameraFitting(nextTurn, from: rider, using: map.camera, on: map, padding: configuration.maneuverPadding)
+            : nil
 
         var desiredPitch = update.pitch
         if let pitch = configuration.maneuverPitch, let progress = update.progress {
@@ -157,7 +213,7 @@ final class NavigationManeuverCamera {
         }
 
         let pose = map.camera
-        pose.centerCoordinate = update.location.coordinate
+        pose.centerCoordinate = rider
         if update.location.course >= 0, update.location.course.isFinite {
             let headingDelta = (update.location.course - pose.heading).remainder(dividingBy: 360)
             let heading = limitedMove(
@@ -172,7 +228,40 @@ final class NavigationManeuverCamera {
             toward: desiredPitch,
             maximumChange: configuration.maximumPitchDegreesPerSecond * duration
         )
-        pose.altitude = MLNAltitudeForZoomLevel(zoom, pose.pitch, update.location.coordinate.latitude, map.bounds.size)
+        let activeCompound = compoundManeuvers(for: update)
+        var framingWeight = maneuverFramingWeight(for: update)
+        if let activeCompound, let progress = update.progress, activeCompound.isApproachingSecond(in: progress) {
+            // The second turn just became the next one. Keep the whole pair in view through the handoff.
+            framingWeight = 1
+        }
+        let maneuverFit: (center: CLLocationCoordinate2D, zoom: Double)?
+        if framingWeight > 0, let framing = configuration.maneuverFraming {
+            let padding = framing.viewportPadding
+            maneuverFit = cameraFitting(
+                activeCompound?.path ?? nextTurn + (update.progress?.outgoingPath ?? []),
+                from: rider,
+                using: pose,
+                on: map,
+                padding: .init(top: padding, left: padding, bottom: padding, right: padding)
+            )
+        } else {
+            maneuverFit = nil
+        }
+        var desiredZoom = targetZoom(for: update, on: map, fittedZoom: baseFit?.zoom)
+        if let maneuverFit, maneuverFit.zoom < desiredZoom {
+            let fitZoom = max(configuration.zoomRange.lowerBound, maneuverFit.zoom)
+            desiredZoom += (fitZoom - desiredZoom) * framingWeight
+        }
+        desiredZoom = min(map.maximumZoomLevel, max(map.minimumZoomLevel, desiredZoom))
+        let zoom = animatedZoom(toward: desiredZoom, from: map.zoomLevel, for: update, duration: duration)
+        if let maneuverFit {
+            // Keep the rider in frame while the existing zoom animation widens the map.
+            let centerWeight = min(framingWeight, pow(2, maneuverFit.zoom - zoom))
+            pose.centerCoordinate = Self.interpolatedCoordinate(
+                from: rider, to: maneuverFit.center, fraction: centerWeight
+            )
+        }
+        pose.altitude = MLNAltitudeForZoomLevel(zoom, pose.pitch, pose.centerCoordinate.latitude, map.bounds.size)
         if hasNewPosition {
             locationManager.lastLocation = update.location
         }
@@ -228,7 +317,7 @@ final class NavigationManeuverCamera {
         }
     }
 
-    private func targetZoom(for update: Update, on map: MLNMapView) -> Double {
+    private func targetZoom(for update: Update, on map: MLNMapView, fittedZoom: Double?) -> Double {
         guard update.automaticallyAdjustsZoom, let progress = update.progress else {
             previousProgress = nil
             closeTurnZoom = nil
@@ -249,42 +338,84 @@ final class NavigationManeuverCamera {
         }
         previousProgress = progress
 
-        let fittedZoom = zoomFittingTurn(
-            progress.nextTurn, from: update.location.coordinate, on: map, padding: configuration.maneuverPadding
-        )
         let fittedTarget = min(
             configuration.zoomRange.upperBound,
-            max(configuration.minimumZoom(for: update.location.speed), fittedZoom)
+            max(configuration.minimumZoom(for: update.location.speed), fittedZoom ?? map.zoomLevel)
         )
         return max(fittedTarget, closeTurnZoom ?? fittedTarget)
     }
 
-    private func zoomFittingTurn(
-        _ turn: RouteProgress.Turn?,
+    private func cameraFitting(
+        _ points: [RouteProgress.Turn],
         from location: CLLocationCoordinate2D,
+        using pose: MLNMapCamera,
         on map: MLNMapView,
         padding: UIEdgeInsets
-    ) -> Double {
-        guard let turn, location.latitude != turn.latitude || location.longitude != turn.longitude else {
-            return map.zoomLevel
-        }
-
-        // Fit the shorter longitude span for a maneuver across the antimeridian.
-        let longitude = location.longitude + (turn.longitude - location.longitude).remainder(dividingBy: 360)
-        let bounds = MLNCoordinateBounds(
-            sw: CLLocationCoordinate2D(latitude: min(location.latitude, turn.latitude),
-                                       longitude: min(location.longitude, longitude)),
-            ne: CLLocationCoordinate2D(latitude: max(location.latitude, turn.latitude),
-                                       longitude: max(location.longitude, longitude))
-        )
+    ) -> (center: CLLocationCoordinate2D, zoom: Double)? {
+        guard !points.isEmpty else { return nil }
         let viewport = map.bounds.inset(by: map.contentInset).inset(by: padding)
-        guard !viewport.isEmpty else { return map.zoomLevel }
+        guard !viewport.isEmpty else { return nil }
 
-        let camera = map.camera(map.camera, fitting: bounds, edgePadding: padding)
+        var bounds = MLNCoordinateBounds(sw: location, ne: location)
+        for point in points {
+            // Preserve the short span across the antimeridian.
+            let longitude = location.longitude + (point.longitude - location.longitude).remainder(dividingBy: 360)
+            bounds.sw.latitude = min(bounds.sw.latitude, point.latitude)
+            bounds.ne.latitude = max(bounds.ne.latitude, point.latitude)
+            bounds.sw.longitude = min(bounds.sw.longitude, longitude)
+            bounds.ne.longitude = max(bounds.ne.longitude, longitude)
+        }
+        guard bounds.sw.latitude != bounds.ne.latitude || bounds.sw.longitude != bounds.ne.longitude else { return nil }
+        let camera = map.camera(pose, fitting: bounds, edgePadding: padding)
         let zoom = MLNZoomLevelForAltitude(
             camera.altitude, camera.pitch, camera.centerCoordinate.latitude, map.bounds.size
         )
-        return zoom.isFinite ? zoom : map.zoomLevel
+        guard zoom.isFinite, CLLocationCoordinate2DIsValid(camera.centerCoordinate) else { return nil }
+        return (camera.centerCoordinate, zoom)
+    }
+
+    private func maneuverFramingWeight(for update: Update) -> Double {
+        guard update.automaticallyAdjustsZoom,
+              let range = update.configuration.maneuverFraming?.distanceRange,
+              let distance = update.progress?.distanceToTurn else { return 0 }
+        if distance <= range.lowerBound { return 1 }
+        if distance >= range.upperBound { return 0 }
+        return 1 - easedFraction((distance - range.lowerBound) / (range.upperBound - range.lowerBound))
+    }
+
+    private func compoundManeuvers(for update: Update) -> RouteProgress.CompoundManeuvers? {
+        guard update.automaticallyAdjustsZoom, let progress = update.progress else {
+            compoundManeuvers = nil
+            return nil
+        }
+        if let compoundManeuvers, compoundManeuvers.containsNextTurn(in: progress) {
+            return compoundManeuvers
+        }
+        compoundManeuvers = progress.compoundManeuvers
+        return compoundManeuvers
+    }
+
+    private func animatedZoom(toward target: Double, from current: Double, for update: Update, duration: TimeInterval) -> Double {
+        guard update.automaticallyAdjustsZoom else { return target }
+        let delta = target - current
+        guard abs(delta) > update.configuration.zoomDeadband else { return current }
+        let transition = delta < 0 ? update.configuration.zoomOut : update.configuration.zoomIn
+        let response = 1 - exp(-duration / transition.responseTime)
+        return limitedMove(
+            from: current,
+            toward: current + delta * response,
+            maximumChange: transition.maximumLevelsPerSecond * duration
+        )
+    }
+
+    private static func interpolatedCoordinate(
+        from start: CLLocationCoordinate2D, to end: CLLocationCoordinate2D, fraction: Double
+    ) -> CLLocationCoordinate2D {
+        let longitudeDelta = (end.longitude - start.longitude).remainder(dividingBy: 360)
+        return .init(
+            latitude: start.latitude + (end.latitude - start.latitude) * fraction,
+            longitude: (start.longitude + longitudeDelta * fraction).remainder(dividingBy: 360)
+        )
     }
 
     private func limitedMove(from current: Double, toward target: Double, maximumChange: Double) -> Double {
