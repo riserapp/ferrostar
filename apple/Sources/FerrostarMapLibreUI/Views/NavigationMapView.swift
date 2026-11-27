@@ -1,3 +1,5 @@
+import Combine
+import CoreLocation
 import FerrostarCore
 import struct FerrostarCoreFFI.RouteStep
 import FerrostarSwiftUI
@@ -26,6 +28,7 @@ public struct NavigationMapView: View {
     let activity: MapActivity
     private let followCameraConfiguration: NavigationFollowCameraConfiguration?
     private let automaticallyAdjustsFollowZoom: Bool
+    private let navigationStateUpdates: AnyPublisher<NavigationState?, Never>?
     @State private var maneuverCamera = NavigationManeuverCamera()
 
     // TODO: Configurable camera and user "puck" rotation modes
@@ -50,6 +53,7 @@ public struct NavigationMapView: View {
     ///   - followCameraConfiguration: Opt in to route-aware course following with the given settings.
     ///     Pass nil to use the map's built-in follow camera.
     ///   - automaticallyAdjustsFollowZoom: Use route progress to adjust zoom in the route-aware camera.
+    ///   - navigationStateUpdates: Optional main-thread updates to drive the follow camera between SwiftUI redraws.
     ///   - onStyleLoaded: The map's style has loaded and the camera can be manipulated (e.g. to user tracking).
     ///   - makeMapContent: Custom maplibre symbols to display on the map view.
     public init(
@@ -60,6 +64,7 @@ public struct NavigationMapView: View {
         activity: MapActivity = .standard,
         followCameraConfiguration: NavigationFollowCameraConfiguration? = nil,
         automaticallyAdjustsFollowZoom: Bool = true,
+        navigationStateUpdates: AnyPublisher<NavigationState?, Never>? = nil,
         onUserTrackingModeChanged: @escaping (MLNUserTrackingMode, Bool) -> Void = { _, _ in },
         onStyleLoaded: @escaping ((MLNStyle) -> Void),
         @MapViewContentBuilder _ makeMapContent: () -> [StyleLayerDefinition] = { [] }
@@ -74,6 +79,7 @@ public struct NavigationMapView: View {
         self.activity = activity
         self.followCameraConfiguration = followCameraConfiguration
         self.automaticallyAdjustsFollowZoom = automaticallyAdjustsFollowZoom
+        self.navigationStateUpdates = navigationStateUpdates
     }
 
     public var body: some View {
@@ -106,8 +112,14 @@ public struct NavigationMapView: View {
                 onStyleLoaded(style)
                 maneuverCamera.applyLatestUpdate(locationManager: activeNavigatingLocationManager)
             }
-            .onChange(of: followCameraUpdate) { update in
+            .onChange(of: navigationStateUpdates == nil ? followCameraUpdate(for: navigationState) : nil) { update in
                 maneuverCamera.update(update, locationManager: activeNavigatingLocationManager)
+            }
+            .onReceive(navigationStateUpdates ?? Empty().eraseToAnyPublisher()) { state in
+                updateFollowCamera(for: state)
+            }
+            .onChange(of: streamingCameraSettings) { _ in
+                updateFollowCamera(for: navigationState)
             }
             .onChange(of: viewport) { _ in
                 guard ownsFollowCamera, followCameraConfiguration?.maneuverFraming != nil else { return }
@@ -117,7 +129,7 @@ public struct NavigationMapView: View {
                 }
             }
             .onAppear {
-                maneuverCamera.update(followCameraUpdate, locationManager: activeNavigatingLocationManager)
+                updateFollowCamera(for: navigationState)
             }
             .onDisappear { maneuverCamera.stop() }
             .ignoresSafeArea(.all)
@@ -162,12 +174,29 @@ public struct NavigationMapView: View {
             camera.isTrackingUserLocationWithCourse
     }
 
-    private var followCameraUpdate: NavigationManeuverCamera.Update? {
-        guard ownsFollowCamera, let followCameraConfiguration,
+    private struct StreamingCameraSettings: Equatable {
+        let camera: MapViewCamera
+        let configuration: NavigationFollowCameraConfiguration?
+        let automaticallyAdjustsZoom: Bool
+    }
+
+    private var streamingCameraSettings: StreamingCameraSettings? {
+        guard navigationStateUpdates != nil else { return nil }
+        return .init(camera: camera, configuration: followCameraConfiguration,
+                     automaticallyAdjustsZoom: automaticallyAdjustsFollowZoom)
+    }
+
+    private func updateFollowCamera(for state: NavigationState?) {
+        maneuverCamera.update(followCameraUpdate(for: state), locationManager: activeNavigatingLocationManager)
+    }
+
+    private func followCameraUpdate(for navigationState: NavigationState?) -> NavigationManeuverCamera.Update? {
+        guard let followCameraConfiguration, navigationState?.isNavigating == true,
               let navigationState, let userLocation = navigationState.preferredUserLocation,
               case let .trackingUserLocationWithCourse(zoom, pitch, _) = camera.state
         else { return nil }
 
+        let location = followCameraLocation(from: userLocation.clLocation)
         let progress: NavigationManeuverCamera.RouteProgress?
         if navigationState.currentDeviation == .noDeviation, !navigationState.isCalculatingNewRoute,
            let steps = navigationState.remainingSteps,
@@ -215,7 +244,7 @@ public struct NavigationMapView: View {
                 approach: automaticallyAdjustsFollowZoom ? makeApproach(
                     in: navigationState,
                     steps: steps,
-                    from: userLocation.clLocation,
+                    from: location,
                     distanceToTurn: distance,
                     configuration: followCameraConfiguration
                 ) : nil
@@ -225,13 +254,28 @@ public struct NavigationMapView: View {
         }
 
         return .init(
-            location: userLocation.clLocation,
+            location: location,
             followZoom: zoom,
             pitch: pitch,
             automaticallyAdjustsZoom: automaticallyAdjustsFollowZoom,
             configuration: followCameraConfiguration,
             progress: progress
         )
+    }
+
+    private func followCameraLocation(from location: CLLocation) -> CLLocation {
+        guard navigationStateUpdates != nil, !location.course.isFinite || location.course < 0 else { return location }
+        let puckLocation = activeNavigatingLocationManager.lastLocation
+        // Reuse a course fallback the host supplied for this exact fix.
+        guard puckLocation.course.isFinite, puckLocation.course >= 0, puckLocation.timestamp == location.timestamp,
+              puckLocation.coordinate == location.coordinate else { return location }
+        if puckLocation.speed == location.speed {
+            return puckLocation
+        }
+        // A display fallback may normalize unknown speed. Keep route speed for camera fitting.
+        return CLLocation(coordinate: location.coordinate, altitude: location.altitude,
+                          horizontalAccuracy: location.horizontalAccuracy, verticalAccuracy: location.verticalAccuracy,
+                          course: puckLocation.course, speed: location.speed, timestamp: location.timestamp)
     }
 
     private func makeApproach(

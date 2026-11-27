@@ -1,3 +1,4 @@
+import Combine
 import FerrostarCore
 import FerrostarCoreFFI
 import FerrostarMapLibreUI
@@ -19,6 +20,9 @@ public struct CarPlayNavigationView: View {
     let locationManagerConfiguration: NavigationLocationManagerConfiguration?
 
     private let navigationState: NavigationState?
+    private let navigationStateUpdates: AnyPublisher<NavigationState?, Never>?
+    private let followCameraConfiguration: NavigationFollowCameraConfiguration?
+    private let automaticallyAdjustsFollowZoom: Bool
     private let userLayers: [StyleLayerDefinition]
 
     public var minimumSafeAreaInsets: EdgeInsets
@@ -30,9 +34,12 @@ public struct CarPlayNavigationView: View {
     /// - Parameters:
     ///   - styleURL: The map's style url.
     ///   - camera: The camera binding that represents the current camera on the map.
-    ///   - navigationCamera: The default navigation camera. This sets the initial camera & is also used when the center
-    /// on user button it tapped.
+    ///   - navigationCamera: The initial camera for the built-in follow path. When using a route-aware
+    ///   camera configuration, control the follow mode through the camera binding.
     ///   - navigationState: The current ferrostar navigation state provided by the Ferrostar core.
+    ///   - navigationStateUpdates: Optional main-thread updates to drive the follow camera between SwiftUI redraws.
+    ///   - followCameraConfiguration: Optional route-aware camera settings for active guidance.
+    ///   - automaticallyAdjustsFollowZoom: Enables automatic zoom when the route-aware camera is active.
     ///   - minimumSafeAreaInsets: The minimum padding to apply from safe edges. See `complementSafeAreaInsets`.
     ///   - onTapExit: An optional behavior to run when the ``TripProgressView`` exit button is tapped. When nil
     /// (default) the
@@ -45,12 +52,18 @@ public struct CarPlayNavigationView: View {
         navigationState: NavigationState?,
         locationManagerConfiguration: NavigationLocationManagerConfiguration? = nil,
         minimumSafeAreaInsets: EdgeInsets = EdgeInsets(top: 16, leading: 16, bottom: 16, trailing: 16),
+        navigationStateUpdates: AnyPublisher<NavigationState?, Never>? = nil,
+        followCameraConfiguration: NavigationFollowCameraConfiguration? = nil,
+        automaticallyAdjustsFollowZoom: Bool = true,
         @MapViewContentBuilder makeMapContent: () -> [StyleLayerDefinition] = { [] }
     ) {
         self.styleURL = styleURL
         self.navigationState = navigationState
         self.locationManagerConfiguration = locationManagerConfiguration
         self.minimumSafeAreaInsets = minimumSafeAreaInsets
+        self.navigationStateUpdates = navigationStateUpdates
+        self.followCameraConfiguration = followCameraConfiguration
+        self.automaticallyAdjustsFollowZoom = automaticallyAdjustsFollowZoom
 
         userLayers = makeMapContent()
         _camera = camera
@@ -65,8 +78,13 @@ public struct CarPlayNavigationView: View {
                     camera: $camera,
                     navigationState: navigationState,
                     locationManagerConfiguration: locationManagerConfiguration,
+                    followCameraConfiguration: followCameraConfiguration,
+                    automaticallyAdjustsFollowZoom: automaticallyAdjustsFollowZoom,
+                    navigationStateUpdates: navigationStateUpdates,
                     onStyleLoaded: { _ in
-                        camera = navigationCamera
+                        if followCameraConfiguration == nil {
+                            camera = navigationCamera
+                        }
                     }
                 ) {
                     userLayers
