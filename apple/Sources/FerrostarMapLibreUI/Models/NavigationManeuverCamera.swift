@@ -31,6 +31,7 @@ final class NavigationManeuverCamera {
             let second: Turn
             let stepCountBeforeFirst: Int
             let path: [Turn]
+            let endsAtRoundaboutExit: Bool
 
             func containsNextTurn(in progress: RouteProgress) -> Bool {
                 (progress.remainingStepCount == stepCountBeforeFirst && progress.nextTurn == first) ||
@@ -50,10 +51,41 @@ final class NavigationManeuverCamera {
 
         let remainingStepCount: Int
         let distanceToTurn: CLLocationDistance
+        let remainingDistance: CLLocationDistance
+        let currentStepStart: Turn?
         let nextTurn: Turn?
+        let startsRoundaboutExitHoldAtNextTurn: Bool
         let outgoingPath: [Turn]
         let compoundManeuvers: CompoundManeuvers?
         let approach: Approach?
+    }
+
+    struct RoundaboutExitZoomHold {
+        let minimumZoom: Double
+        let releaseAtRemainingDistance: CLLocationDistance
+
+        init?(
+            after previous: RouteProgress,
+            advancingTo current: RouteProgress,
+            wasApproachingExit: Bool,
+            distance: CLLocationDistance,
+            zoom: Double
+        ) {
+            guard distance > 0, wasApproachingExit,
+                  current.remainingStepCount == previous.remainingStepCount - 1,
+                  let exit = previous.nextTurn, exit == current.currentStepStart
+            else { return nil }
+
+            // Subtract the approach so the hold starts at the exit, even if this fix is already past it.
+            let releaseDistance = previous.remainingDistance - previous.distanceToTurn - distance
+            guard releaseDistance.isFinite else { return nil }
+            releaseAtRemainingDistance = releaseDistance
+            minimumZoom = zoom
+        }
+
+        func isActive(at remainingDistance: CLLocationDistance) -> Bool {
+            remainingDistance.isFinite && remainingDistance > releaseAtRemainingDistance
+        }
     }
 
     struct RouteBounds: Equatable {
@@ -97,6 +129,7 @@ final class NavigationManeuverCamera {
     private var lastAppliedViewport: Viewport?
     private var previousProgress: RouteProgress?
     private var closeTurnZoom: Double?
+    private var roundaboutExitZoomHold: RoundaboutExitZoomHold?
     private var compoundManeuvers: RouteProgress.CompoundManeuvers?
     private var courseArrow: CAShapeLayer?
 
@@ -159,6 +192,7 @@ final class NavigationManeuverCamera {
         lastAppliedViewport = nil
         previousProgress = nil
         closeTurnZoom = nil
+        roundaboutExitZoomHold = nil
         compoundManeuvers = nil
     }
 
@@ -206,6 +240,7 @@ final class NavigationManeuverCamera {
         if configurationChanged {
             previousProgress = nil
             closeTurnZoom = nil
+            roundaboutExitZoomHold = nil
             compoundManeuvers = nil
         }
         lastAppliedUpdate = update
@@ -263,6 +298,7 @@ final class NavigationManeuverCamera {
             toward: desiredPitch,
             maximumChange: configuration.maximumPitchDegreesPerSecond * duration
         )
+        let exitZoom = updateRoundaboutExitZoomHold(for: update, zoom: map.zoomLevel)
         let activeCompound = compoundManeuvers(for: update)
         var framingWeight = maneuverFramingWeight(for: update)
         if let activeCompound, let progress = update.progress, activeCompound.isApproachingSecond(in: progress) {
@@ -286,6 +322,9 @@ final class NavigationManeuverCamera {
         if let maneuverFit, maneuverFit.zoom < desiredZoom {
             let fitZoom = max(configuration.zoomRange.lowerBound, maneuverFit.zoom)
             desiredZoom += (fitZoom - desiredZoom) * framingWeight
+        }
+        if let exitZoom {
+            desiredZoom = max(desiredZoom, exitZoom)
         }
         desiredZoom = min(map.maximumZoomLevel, max(map.minimumZoomLevel, desiredZoom))
         let zoom = animatedZoom(toward: desiredZoom, from: map.zoomLevel, for: update, duration: duration)
@@ -470,6 +509,32 @@ final class NavigationManeuverCamera {
         if distance <= range.lowerBound { return 1 }
         if distance >= range.upperBound { return 0 }
         return 1 - easedFraction((distance - range.lowerBound) / (range.upperBound - range.lowerBound))
+    }
+
+    private func updateRoundaboutExitZoomHold(for update: Update, zoom: Double) -> Double? {
+        guard update.automaticallyAdjustsZoom, let progress = update.progress,
+              let distance = update.configuration.maneuverFraming?.roundaboutExitZoomHoldDistance,
+              distance > 0
+        else {
+            roundaboutExitZoomHold = nil
+            return nil
+        }
+        if let previousProgress, let newHold = RoundaboutExitZoomHold(
+            after: previousProgress,
+            advancingTo: progress,
+            wasApproachingExit: previousProgress.startsRoundaboutExitHoldAtNextTurn ||
+                (compoundManeuvers?.endsAtRoundaboutExit == true &&
+                    compoundManeuvers?.isApproachingSecond(in: previousProgress) == true),
+            distance: distance,
+            zoom: zoom
+        ) {
+            roundaboutExitZoomHold = newHold
+        }
+        guard let roundaboutExitZoomHold, roundaboutExitZoomHold.isActive(at: progress.remainingDistance) else {
+            self.roundaboutExitZoomHold = nil
+            return nil
+        }
+        return roundaboutExitZoomHold.minimumZoom
     }
 
     private func compoundManeuvers(for update: Update) -> RouteProgress.CompoundManeuvers? {

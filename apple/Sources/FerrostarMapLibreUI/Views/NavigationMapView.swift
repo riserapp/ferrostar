@@ -171,8 +171,17 @@ public struct NavigationMapView: View {
         let progress: NavigationManeuverCamera.RouteProgress?
         if navigationState.currentDeviation == .noDeviation, !navigationState.isCalculatingNewRoute,
            let steps = navigationState.remainingSteps,
-           let distance = navigationState.currentProgress?.distanceToNextManeuver,
-           distance.isFinite, distance >= 0 {
+           let tripProgress = navigationState.currentProgress,
+           tripProgress.distanceToNextManeuver.isFinite, tripProgress.distanceToNextManeuver >= 0 {
+            let distance = tripProgress.distanceToNextManeuver
+            let currentStep = steps.first
+            let tracksRoundaboutExit = automaticallyAdjustsFollowZoom &&
+                (followCameraConfiguration.maneuverFraming?.roundaboutExitZoomHoldDistance ?? 0) > 0
+            let currentStepStart = tracksRoundaboutExit
+                ? currentStep?.geometry.first.flatMap {
+                    NavigationManeuverCamera.RouteProgress.Turn(validating: $0.clLocationCoordinate2D)
+                }
+                : nil
             let outgoingStep = steps.dropFirst().first
             let nextTurn = (outgoingStep?.geometry.first?.clLocationCoordinate2D)
                 .flatMap(NavigationManeuverCamera.RouteProgress.Turn.init(validating:))
@@ -195,7 +204,11 @@ public struct NavigationMapView: View {
             progress = .init(
                 remainingStepCount: steps.count,
                 distanceToTurn: distance,
+                remainingDistance: tripProgress.distanceRemaining,
+                currentStepStart: currentStepStart,
                 nextTurn: nextTurn,
+                startsRoundaboutExitHoldAtNextTurn: tracksRoundaboutExit &&
+                    shouldHoldZoomAfterManeuver(currentStep: currentStep, outgoingStep: outgoingStep),
                 outgoingPath: outgoingPath,
                 compoundManeuvers: compoundManeuvers,
                 approach: automaticallyAdjustsFollowZoom ? makeApproach(
@@ -305,9 +318,12 @@ public struct NavigationMapView: View {
         framing: NavigationFollowCameraConfiguration.ManeuverFraming
     ) -> NavigationManeuverCamera.RouteProgress.CompoundManeuvers? {
         typealias Turn = NavigationManeuverCamera.RouteProgress.Turn
-        guard let maximumSeparation = framing.compoundManeuverDistance,
-              outgoingStep.distance > 0, outgoingStep.distance <= maximumSeparation,
-              let nextStep = steps.dropFirst(2).first, nextStep.geometry.count > 1,
+        let nearby = framing.compoundManeuverDistance.map { outgoingStep.distance <= $0 } ?? false
+        let throughRoundabout = framing.framesRoundaboutsThroughExit &&
+            isRoundaboutExitStep(after: steps.first, circulatingStep: outgoingStep)
+        guard outgoingStep.distance.isFinite, outgoingStep.distance > 0, outgoingStep.geometry.count > 1,
+              nearby || throughRoundabout,
+              let nextStep = steps.dropFirst(2).first, throughRoundabout || nextStep.geometry.count > 1,
               let secondStart = nextStep.geometry.first?.clLocationCoordinate2D,
               let secondTurn = Turn(validating: secondStart),
               routeStepsJoin(outgoingStep.geometry.last?.clLocationCoordinate2D, secondStart)
@@ -323,8 +339,50 @@ public struct NavigationMapView: View {
             first: firstTurn,
             second: secondTurn,
             stepCountBeforeFirst: steps.count,
-            path: pathBetweenTurns + [secondTurn] + outgoingPath
+            path: pathBetweenTurns + [secondTurn] + outgoingPath,
+            endsAtRoundaboutExit: throughRoundabout
         )
+    }
+
+    private func isRoundaboutExitStep(after approach: RouteStep?, circulatingStep: RouteStep) -> Bool {
+        let numberedEntry = circulatingStep.roundaboutExitNumber != nil
+        let markedEntry = approach.map(hasRoundaboutEntryInstruction) == true
+        guard numberedEntry || markedEntry else { return false }
+
+        // OSRM-style routes can have a numbered circulation step without banner instructions.
+        return hasRoundaboutExitInstruction(circulatingStep) ||
+            (numberedEntry && circulatingStep.visualInstructions.isEmpty)
+    }
+
+    private func shouldHoldZoomAfterManeuver(currentStep: RouteStep?, outgoingStep: RouteStep?) -> Bool {
+        guard let currentStep, let outgoingStep else { return false }
+        if hasRoundaboutExitInstruction(currentStep) ||
+            currentStep.visualInstructions.contains(where: { $0.primaryContent.maneuverType == .roundaboutTurn }) {
+            return true
+        }
+
+        // Some routers describe entry and exit as one maneuver. In that case,
+        // use the upcoming maneuver boundary for the hold, just like the route arrow.
+        return hasRoundaboutEntryInstruction(currentStep) &&
+            !isRoundaboutExitStep(after: currentStep, circulatingStep: outgoingStep)
+    }
+
+    private func hasRoundaboutEntryInstruction(_ step: RouteStep) -> Bool {
+        step.visualInstructions.contains {
+            switch $0.primaryContent.maneuverType {
+            case .roundabout, .rotary: return true
+            default: return false
+            }
+        }
+    }
+
+    private func hasRoundaboutExitInstruction(_ step: RouteStep) -> Bool {
+        step.visualInstructions.contains {
+            switch $0.primaryContent.maneuverType {
+            case .exitRoundabout, .exitRotary: return true
+            default: return false
+            }
+        }
     }
 
     private func updateCameraIfNeeded() {

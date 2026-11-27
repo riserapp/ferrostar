@@ -54,22 +54,33 @@ public struct NavigationFollowCameraConfiguration: Equatable {
         let outgoingDistance: CLLocationDistance
         let viewportPadding: CGFloat
         let compoundManeuverDistance: CLLocationDistance?
+        let framesRoundaboutsThroughExit: Bool
+        let roundaboutExitZoomHoldDistance: CLLocationDistance
 
         /// Fully frame the nearby maneuver at the lower bound, fading to rider-centered
         /// framing by the upper bound. Include up to outgoingDistance meters after the turn.
         /// Reserve viewportPadding points around the fitted area for the marker and route line.
         /// Set compoundManeuverDistance to frame two maneuvers together when their route separation
         /// is within that many meters. By default, the camera frames only the next maneuver.
+        /// Enable framesRoundaboutsThroughExit to keep the entry and exit steps framed together
+        /// when the route identifies them, independent of their separation.
+        /// Set roundaboutExitZoomHoldDistance to keep the exit zoom as a minimum for that
+        /// many meters traveled along the route after a recognized roundabout exit.
         public init(
             distanceRange: ClosedRange<CLLocationDistance>,
             outgoingDistance: CLLocationDistance,
             viewportPadding: CGFloat = 0,
-            compoundManeuverDistance: CLLocationDistance? = nil
+            compoundManeuverDistance: CLLocationDistance? = nil,
+            framesRoundaboutsThroughExit: Bool = false,
+            roundaboutExitZoomHoldDistance: CLLocationDistance = 0
         ) {
             self.distanceRange = distanceRange
             self.outgoingDistance = max(0, outgoingDistance)
             self.viewportPadding = max(0, viewportPadding)
             self.compoundManeuverDistance = compoundManeuverDistance
+            self.framesRoundaboutsThroughExit = framesRoundaboutsThroughExit
+            self.roundaboutExitZoomHoldDistance = roundaboutExitZoomHoldDistance.isFinite
+                ? max(0, roundaboutExitZoomHoldDistance) : 0
         }
     }
 
