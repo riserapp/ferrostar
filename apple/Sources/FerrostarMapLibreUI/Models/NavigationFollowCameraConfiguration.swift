@@ -73,6 +73,105 @@ public struct NavigationFollowCameraConfiguration: Equatable {
         }
     }
 
+    public struct RouteLookahead: Equatable {
+        public struct LongSegment: Equatable {
+            let distanceToTurnRange: ClosedRange<CLLocationDistance>
+            let riderAnchorOffset: CGFloat
+
+            /// Blends into a longer lookahead over a range of distances to the next turn.
+            /// At and above the upper bound, the camera fits the rest of the current step.
+            /// Distances are in meters. The optional rider anchor offset shifts the rider down
+            /// by a fraction of the usable viewport height, from zero up to but excluding one half.
+            public init(
+                distanceToTurnRange: ClosedRange<CLLocationDistance>,
+                riderAnchorOffset: CGFloat = 0
+            ) {
+                self.distanceToTurnRange = distanceToTurnRange
+                self.riderAnchorOffset = (0..<0.5).contains(riderAnchorOffset) ? riderAnchorOffset : 0
+            }
+
+            func weight(for distanceToTurn: CLLocationDistance) -> Double {
+                guard distanceToTurn.isFinite, distanceToTurn > distanceToTurnRange.lowerBound else { return 0 }
+                if distanceToTurn >= distanceToTurnRange.upperBound { return 1 }
+                let fraction = (distanceToTurn - distanceToTurnRange.lowerBound) /
+                    (distanceToTurnRange.upperBound - distanceToTurnRange.lowerBound)
+                return fraction * fraction * (3 - 2 * fraction)
+            }
+        }
+
+        let distanceRange: ClosedRange<CLLocationDistance>
+        let travelTime: TimeInterval
+        let maneuverSpacingMultiplier: Double
+        let longSegment: LongSegment?
+
+        /// Bounds the length of road ahead used for zoom fitting. Speed extends the
+        /// lookahead, and the typical distance between upcoming maneuvers can shorten it.
+        /// A long-segment configuration allows a wider view when there is no turn nearby.
+        /// Distances are in meters and travelTime is in seconds.
+        public init(
+            distanceRange: ClosedRange<CLLocationDistance>,
+            travelTime: TimeInterval,
+            maneuverSpacingMultiplier: Double,
+            longSegment: LongSegment? = nil
+        ) {
+            self.distanceRange = distanceRange
+            self.travelTime = max(0, travelTime)
+            self.maneuverSpacingMultiplier = max(0, maneuverSpacingMultiplier)
+            self.longSegment = longSegment
+        }
+
+        func distance(
+            for speed: CLLocationSpeed,
+            maneuverSpacings: [CLLocationDistance],
+            distanceToTurn: CLLocationDistance
+        ) -> CLLocationDistance {
+            let forwardSpeed = speed.isFinite ? max(0, speed) : 0
+            let spacings = maneuverSpacings.filter { $0.isFinite && $0 > 0 }.sorted()
+            let midpoint = spacings.count / 2
+            let typicalSpacing = spacings.isEmpty
+                ? distanceRange.upperBound
+                : (spacings[(spacings.count - 1) / 2] + spacings[midpoint]) / 2 * maneuverSpacingMultiplier
+            let speedDistance = distanceRange.lowerBound + forwardSpeed * travelTime
+            let normalDistance = max(
+                distanceRange.lowerBound, min(distanceRange.upperBound, speedDistance, typicalSpacing)
+            )
+            let weight = longSegment?.weight(for: distanceToTurn) ?? 0
+            guard weight > 0 else { return normalDistance }
+            let extendedDistance = max(normalDistance, distanceToTurn)
+            return normalDistance + (extendedDistance - normalDistance) * weight
+        }
+    }
+
+    public struct BearingAnticipation: Equatable {
+        let lookaheadDistance: CLLocationDistance
+        let maximumDeviation: CLLocationDirection
+        let minimumSpeed: CLLocationSpeed
+
+        /// Looks ahead along the route by a distance in meters, limiting the difference
+        /// from the rider's course in degrees. Minimum speed is in meters per second.
+        public init(
+            lookaheadDistance: CLLocationDistance,
+            maximumDeviation: CLLocationDirection,
+            minimumSpeed: CLLocationSpeed
+        ) {
+            self.lookaheadDistance = max(0, lookaheadDistance)
+            self.maximumDeviation = min(180, max(0, maximumDeviation))
+            self.minimumSpeed = max(0, minimumSpeed)
+        }
+    }
+
+    public struct LowSpeedCenterStabilization: Equatable {
+        let maximumScreenShift: CGFloat
+        let maximumSpeed: CLLocationSpeed
+
+        /// Ignores camera center shifts of up to maximumScreenShift screen points
+        /// at speeds up to maximumSpeed meters per second.
+        public init(maximumScreenShift: CGFloat, maximumSpeed: CLLocationSpeed) {
+            self.maximumScreenShift = max(0, maximumScreenShift)
+            self.maximumSpeed = max(0, maximumSpeed)
+        }
+    }
+
     let zoomRange: ClosedRange<Double>
     let speedZoomBands: [SpeedZoomBand]
     let maneuverPadding: UIEdgeInsets
@@ -85,6 +184,9 @@ public struct NavigationFollowCameraConfiguration: Equatable {
     let maximumPitchDegreesPerSecond: Double
     let showsCourseArrow: Bool
     let maneuverFraming: ManeuverFraming?
+    let routeLookahead: RouteLookahead?
+    let bearingAnticipation: BearingAnticipation?
+    let lowSpeedCenterStabilization: LowSpeedCenterStabilization?
 
     /// Creates a configuration for fitting the location and next maneuver in the viewport.
     ///
@@ -102,6 +204,9 @@ public struct NavigationFollowCameraConfiguration: Equatable {
     ///   - maximumPitchDegreesPerSecond: Maximum tilt rate of the camera.
     ///   - showsCourseArrow: Draw a course arrow on the MapLibre location marker while following.
     ///   - maneuverFraming: Optionally center the rider and a nearby maneuver together.
+    ///   - routeLookahead: Optionally use bounded route geometry for zoom fitting and frame the full approach to nearby turns.
+    ///   - bearingAnticipation: Optionally steer the camera slightly into the upcoming road.
+    ///   - lowSpeedCenterStabilization: Optionally suppress small camera center changes at low speed.
     public init(
         zoomRange: ClosedRange<Double> = 0...22,
         speedZoomBands: [SpeedZoomBand] = [],
@@ -114,7 +219,10 @@ public struct NavigationFollowCameraConfiguration: Equatable {
         maximumHeadingDegreesPerSecond: Double = 90,
         maximumPitchDegreesPerSecond: Double = 45,
         showsCourseArrow: Bool = true,
-        maneuverFraming: ManeuverFraming? = nil
+        maneuverFraming: ManeuverFraming? = nil,
+        routeLookahead: RouteLookahead? = nil,
+        bearingAnticipation: BearingAnticipation? = nil,
+        lowSpeedCenterStabilization: LowSpeedCenterStabilization? = nil
     ) {
         self.zoomRange = zoomRange
         self.speedZoomBands = speedZoomBands.sorted { $0.speedBelow < $1.speedBelow }
@@ -128,6 +236,9 @@ public struct NavigationFollowCameraConfiguration: Equatable {
         self.maximumPitchDegreesPerSecond = max(0, maximumPitchDegreesPerSecond)
         self.showsCourseArrow = showsCourseArrow
         self.maneuverFraming = maneuverFraming
+        self.routeLookahead = routeLookahead
+        self.bearingAnticipation = bearingAnticipation
+        self.lowSpeedCenterStabilization = lowSpeedCenterStabilization
     }
 
     func minimumZoom(for speed: CLLocationSpeed) -> Double {

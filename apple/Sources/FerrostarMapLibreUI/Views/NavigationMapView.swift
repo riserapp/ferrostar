@@ -180,7 +180,7 @@ public struct NavigationMapView: View {
             let compoundManeuvers: NavigationManeuverCamera.RouteProgress.CompoundManeuvers?
             if let framing = followCameraConfiguration.maneuverFraming, let outgoingStep, let nextTurn,
                automaticallyAdjustsFollowZoom, distance < framing.distanceRange.upperBound {
-                outgoingPath = NavigationManeuverCamera.outgoingPath(
+                outgoingPath = NavigationManeuverCamera.routePrefix(
                     from: nextTurn,
                     through: outgoingStep.geometry.dropFirst().lazy.map(\.clLocationCoordinate2D),
                     distance: framing.outgoingDistance
@@ -197,7 +197,14 @@ public struct NavigationMapView: View {
                 distanceToTurn: distance,
                 nextTurn: nextTurn,
                 outgoingPath: outgoingPath,
-                compoundManeuvers: compoundManeuvers
+                compoundManeuvers: compoundManeuvers,
+                approach: automaticallyAdjustsFollowZoom ? makeApproach(
+                    in: navigationState,
+                    steps: steps,
+                    from: userLocation.clLocation,
+                    distanceToTurn: distance,
+                    configuration: followCameraConfiguration
+                ) : nil
             )
         } else {
             progress = nil
@@ -213,6 +220,84 @@ public struct NavigationMapView: View {
         )
     }
 
+    private func makeApproach(
+        in state: NavigationState,
+        steps: [RouteStep],
+        from rider: CLLocation,
+        distanceToTurn: CLLocationDistance,
+        configuration: NavigationFollowCameraConfiguration
+    ) -> NavigationManeuverCamera.RouteProgress.Approach? {
+        typealias Turn = NavigationManeuverCamera.RouteProgress.Turn
+        guard configuration.routeLookahead != nil || configuration.bearingAnticipation != nil,
+              case let .navigating(segmentIndex, _, _, _, _, _, _, _, _, _, _) = state.tripState,
+              let segmentIndex, let index = Int(exactly: segmentIndex),
+              let geometry = steps.first?.geometry, index < geometry.count - 1,
+              let origin = Turn(validating: rider.coordinate)
+        else { return nil }
+
+        // Ferrostar reports the snapped segment origin. Start at the rider and
+        // skip the part of the step we've already traveled, even on a hairpin.
+        let remaining = geometry.dropFirst(index + 1)
+        let coordinates = remaining.lazy.map(\.clLocationCoordinate2D)
+        let outgoing = steps.dropFirst().first?.geometry
+        let hasConnectedTurn = routeStepsJoin(
+            geometry.last?.clLocationCoordinate2D, outgoing?.first?.clLocationCoordinate2D
+        )
+
+        let lookaheadBounds: NavigationManeuverCamera.RouteBounds?
+        if let lookahead = configuration.routeLookahead {
+            let spacings = steps.dropFirst().prefix(3).map(\.distance)
+            let distance = lookahead.distance(
+                for: rider.speed, maneuverSpacings: spacings, distanceToTurn: distanceToTurn
+            )
+            if distance >= distanceToTurn {
+                // The full remaining step can be large. Keep only its bounds.
+                lookaheadBounds = .init(
+                    from: origin.coordinate, through: coordinates.compactMap(Turn.init(validating:))
+                )
+            } else {
+                let path = NavigationManeuverCamera.routePrefix(from: origin, through: coordinates, distance: distance)
+                lookaheadBounds = .init(from: origin.coordinate, through: path)
+            }
+        } else {
+            lookaheadBounds = nil
+        }
+
+        let maneuverPath: [Turn]
+        if configuration.routeLookahead != nil, let framing = configuration.maneuverFraming,
+           distanceToTurn <= framing.distanceRange.upperBound, hasConnectedTurn {
+            maneuverPath = NavigationManeuverCamera.routePrefix(
+                from: origin, through: coordinates, distance: framing.distanceRange.upperBound + framing.outgoingDistance
+            )
+        } else {
+            maneuverPath = []
+        }
+
+        let bearingTarget: Turn?
+        if let anticipation = configuration.bearingAnticipation,
+           rider.course.isFinite, rider.course >= 0, rider.speed.isFinite, rider.speed >= anticipation.minimumSpeed {
+            let afterTurn = hasConnectedTurn && distanceToTurn < anticipation.lookaheadDistance
+                ? outgoing?.dropFirst() ?? []
+                : []
+            let bearingCoordinates = [remaining, afterTurn].lazy.joined().map(\.clLocationCoordinate2D)
+            bearingTarget = NavigationManeuverCamera.routePrefix(
+                from: origin, through: bearingCoordinates, distance: anticipation.lookaheadDistance
+            ).last
+        } else {
+            bearingTarget = nil
+        }
+
+        return .init(lookaheadBounds: lookaheadBounds, maneuverPath: maneuverPath, bearingTarget: bearingTarget)
+    }
+
+    private func routeStepsJoin(_ firstEnd: CLLocationCoordinate2D?, _ secondStart: CLLocationCoordinate2D?) -> Bool {
+        guard let firstEnd, let secondStart,
+              CLLocationCoordinate2DIsValid(firstEnd), CLLocationCoordinate2DIsValid(secondStart)
+        else { return false }
+        return CLLocation(latitude: firstEnd.latitude, longitude: firstEnd.longitude)
+            .distance(from: CLLocation(latitude: secondStart.latitude, longitude: secondStart.longitude)) <= 10
+    }
+
     private func makeCompoundManeuvers(
         in steps: [RouteStep],
         from firstTurn: NavigationManeuverCamera.RouteProgress.Turn,
@@ -225,14 +310,11 @@ public struct NavigationMapView: View {
               let nextStep = steps.dropFirst(2).first, nextStep.geometry.count > 1,
               let secondStart = nextStep.geometry.first?.clLocationCoordinate2D,
               let secondTurn = Turn(validating: secondStart),
-              let firstEnd = outgoingStep.geometry.last?.clLocationCoordinate2D,
-              CLLocationCoordinate2DIsValid(firstEnd),
-              CLLocation(latitude: firstEnd.latitude, longitude: firstEnd.longitude)
-                .distance(from: CLLocation(latitude: secondStart.latitude, longitude: secondStart.longitude)) <= 10
+              routeStepsJoin(outgoingStep.geometry.last?.clLocationCoordinate2D, secondStart)
         else { return nil }
 
         let pathBetweenTurns = outgoingStep.geometry.compactMap { Turn(validating: $0.clLocationCoordinate2D) }
-        let outgoingPath = NavigationManeuverCamera.outgoingPath(
+        let outgoingPath = NavigationManeuverCamera.routePrefix(
             from: secondTurn,
             through: nextStep.geometry.dropFirst().lazy.map(\.clLocationCoordinate2D),
             distance: framing.outgoingDistance

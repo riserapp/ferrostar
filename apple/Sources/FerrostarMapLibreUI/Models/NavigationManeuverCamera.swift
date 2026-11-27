@@ -42,11 +42,39 @@ final class NavigationManeuverCamera {
             }
         }
 
+        struct Approach: Equatable {
+            let lookaheadBounds: RouteBounds?
+            let maneuverPath: [Turn]
+            let bearingTarget: Turn?
+        }
+
         let remainingStepCount: Int
         let distanceToTurn: CLLocationDistance
         let nextTurn: Turn?
         let outgoingPath: [Turn]
         let compoundManeuvers: CompoundManeuvers?
+        let approach: Approach?
+    }
+
+    struct RouteBounds: Equatable {
+        let southwest: RouteProgress.Turn
+        let northeast: RouteProgress.Turn
+
+        init?(from location: CLLocationCoordinate2D, through points: some Sequence<RouteProgress.Turn>) {
+            var southwest = location
+            var northeast = location
+            for point in points {
+                // Use the shorter span when the remaining road crosses the antimeridian.
+                let longitude = location.longitude + (point.longitude - location.longitude).remainder(dividingBy: 360)
+                southwest.latitude = min(southwest.latitude, point.latitude)
+                northeast.latitude = max(northeast.latitude, point.latitude)
+                southwest.longitude = min(southwest.longitude, longitude)
+                northeast.longitude = max(northeast.longitude, longitude)
+            }
+            guard southwest.latitude != northeast.latitude || southwest.longitude != northeast.longitude else { return nil }
+            self.southwest = .init(coordinate: southwest)
+            self.northeast = .init(coordinate: northeast)
+        }
     }
 
     struct Update: Equatable {
@@ -72,7 +100,7 @@ final class NavigationManeuverCamera {
     private var compoundManeuvers: RouteProgress.CompoundManeuvers?
     private var courseArrow: CAShapeLayer?
 
-    static func outgoingPath(
+    static func routePrefix(
         from turn: RouteProgress.Turn,
         through coordinates: some Sequence<CLLocationCoordinate2D>,
         distance: CLLocationDistance
@@ -188,8 +216,14 @@ final class NavigationManeuverCamera {
         let duration = interval > 0 ? min(1, max(0.15, interval)) : 0.45
         let rider = update.location.coordinate
         let nextTurn = update.progress?.nextTurn.map { [$0] } ?? []
+        let approach = update.progress?.approach
         let baseFit = update.automaticallyAdjustsZoom
-            ? cameraFitting(nextTurn, from: rider, using: map.camera, on: map, padding: configuration.maneuverPadding)
+            ? cameraFitting(
+                approach?.lookaheadBounds ?? RouteBounds(from: rider, through: nextTurn),
+                using: map.camera,
+                on: map,
+                padding: configuration.maneuverPadding
+            )
             : nil
 
         var desiredPitch = update.pitch
@@ -213,9 +247,10 @@ final class NavigationManeuverCamera {
         }
 
         let pose = map.camera
+        let displayedCenter = pose.centerCoordinate
         pose.centerCoordinate = rider
-        if update.location.course >= 0, update.location.course.isFinite {
-            let headingDelta = (update.location.course - pose.heading).remainder(dividingBy: 360)
+        if let targetHeading = targetHeading(for: update) {
+            let headingDelta = (targetHeading - pose.heading).remainder(dividingBy: 360)
             let heading = limitedMove(
                 from: pose.heading,
                 toward: pose.heading + headingDelta,
@@ -237,9 +272,9 @@ final class NavigationManeuverCamera {
         let maneuverFit: (center: CLLocationCoordinate2D, zoom: Double)?
         if framingWeight > 0, let framing = configuration.maneuverFraming {
             let padding = framing.viewportPadding
+            let maneuverPath = activeCompound?.path ?? nextTurn + (update.progress?.outgoingPath ?? [])
             maneuverFit = cameraFitting(
-                activeCompound?.path ?? nextTurn + (update.progress?.outgoingPath ?? []),
-                from: rider,
+                RouteBounds(from: rider, through: (approach?.maneuverPath ?? []) + maneuverPath),
                 using: pose,
                 on: map,
                 padding: .init(top: padding, left: padding, bottom: padding, right: padding)
@@ -261,6 +296,15 @@ final class NavigationManeuverCamera {
                 from: rider, to: maneuverFit.center, fraction: centerWeight
             )
         }
+        if !settingsChanged, !viewportChanged,
+           previous?.progress?.remainingStepCount == update.progress?.remainingStepCount,
+           let stabilization = configuration.lowSpeedCenterStabilization,
+           shouldHoldCenter(
+               from: displayedCenter, to: pose.centerCoordinate, speed: update.location.speed,
+               stabilization: stabilization, on: map
+           ) {
+            pose.centerCoordinate = displayedCenter
+        }
         pose.altitude = MLNAltitudeForZoomLevel(zoom, pose.pitch, pose.centerCoordinate.latitude, map.bounds.size)
         if hasNewPosition {
             locationManager.lastLocation = update.location
@@ -275,9 +319,64 @@ final class NavigationManeuverCamera {
             pose,
             withDuration: duration,
             animationTimingFunction: CAMediaTimingFunction(name: .linear),
-            edgePadding: .zero,
+            edgePadding: longSegmentPadding(for: update, viewport: viewport, maneuverWeight: framingWeight),
             completionHandler: nil
         )
+    }
+
+    private func longSegmentPadding(for update: Update, viewport: Viewport, maneuverWeight: Double) -> UIEdgeInsets {
+        guard update.automaticallyAdjustsZoom, update.location.course.isFinite, update.location.course >= 0,
+              let longSegment = update.configuration.routeLookahead?.longSegment,
+              longSegment.riderAnchorOffset > 0, let progress = update.progress else { return .zero }
+
+        let weight = CGFloat(longSegment.weight(for: progress.distanceToTurn) * (1 - maneuverWeight))
+        let height = max(0, viewport.size.height - viewport.insets.top - viewport.insets.bottom)
+        // MapLibre centers the rider in the padded map area.
+        return .init(top: 2 * height * longSegment.riderAnchorOffset * weight, left: 0, bottom: 0, right: 0)
+    }
+
+    private func targetHeading(for update: Update) -> CLLocationDirection? {
+        let course = update.location.course
+        guard course.isFinite, course >= 0 else { return nil }
+        guard update.automaticallyAdjustsZoom, let anticipation = update.configuration.bearingAnticipation,
+              update.location.speed.isFinite, update.location.speed >= anticipation.minimumSpeed,
+              let target = update.progress?.approach?.bearingTarget,
+              let roadBearing = Self.bearing(from: update.location.coordinate, to: target.coordinate)
+        else { return course }
+
+        let adjustment = (roadBearing - course).remainder(dividingBy: 360)
+        let limitedAdjustment = min(anticipation.maximumDeviation, max(-anticipation.maximumDeviation, adjustment))
+        // Fade out when the target is behind the rider, where the turn direction can flip across 180°.
+        let weight = 1 - easedFraction((abs(adjustment) - 90) / 60)
+        return course + limitedAdjustment * weight
+    }
+
+    private func shouldHoldCenter(
+        from current: CLLocationCoordinate2D,
+        to target: CLLocationCoordinate2D,
+        speed: CLLocationSpeed,
+        stabilization: NavigationFollowCameraConfiguration.LowSpeedCenterStabilization,
+        on map: MLNMapView
+    ) -> Bool {
+        guard stabilization.maximumScreenShift > 0, (0...stabilization.maximumSpeed).contains(speed) else { return false }
+        let start = map.convert(current, toPointTo: map)
+        let end = map.convert(target, toPointTo: map)
+        return hypot(end.x - start.x, end.y - start.y) <= stabilization.maximumScreenShift
+    }
+
+    private static func bearing(
+        from start: CLLocationCoordinate2D,
+        to end: CLLocationCoordinate2D
+    ) -> CLLocationDirection? {
+        let longitudeDelta = (end.longitude - start.longitude).remainder(dividingBy: 360) * .pi / 180
+        let startLatitude = start.latitude * .pi / 180
+        let endLatitude = end.latitude * .pi / 180
+        let east = sin(longitudeDelta) * cos(endLatitude)
+        let north = cos(startLatitude) * sin(endLatitude) -
+            sin(startLatitude) * cos(endLatitude) * cos(longitudeDelta)
+        // A chord shorter than roughly five meters is too sensitive to location noise.
+        guard hypot(east, north) > 5.0 / 6_371_000 else { return nil }
+        return atan2(east, north) * 180 / .pi
     }
 
     private func updateCourseArrow(
@@ -346,26 +445,16 @@ final class NavigationManeuverCamera {
     }
 
     private func cameraFitting(
-        _ points: [RouteProgress.Turn],
-        from location: CLLocationCoordinate2D,
+        _ routeBounds: RouteBounds?,
         using pose: MLNMapCamera,
         on map: MLNMapView,
         padding: UIEdgeInsets
     ) -> (center: CLLocationCoordinate2D, zoom: Double)? {
-        guard !points.isEmpty else { return nil }
+        guard let routeBounds else { return nil }
         let viewport = map.bounds.inset(by: map.contentInset).inset(by: padding)
         guard !viewport.isEmpty else { return nil }
 
-        var bounds = MLNCoordinateBounds(sw: location, ne: location)
-        for point in points {
-            // Preserve the short span across the antimeridian.
-            let longitude = location.longitude + (point.longitude - location.longitude).remainder(dividingBy: 360)
-            bounds.sw.latitude = min(bounds.sw.latitude, point.latitude)
-            bounds.ne.latitude = max(bounds.ne.latitude, point.latitude)
-            bounds.sw.longitude = min(bounds.sw.longitude, longitude)
-            bounds.ne.longitude = max(bounds.ne.longitude, longitude)
-        }
-        guard bounds.sw.latitude != bounds.ne.latitude || bounds.sw.longitude != bounds.ne.longitude else { return nil }
+        let bounds = MLNCoordinateBounds(sw: routeBounds.southwest.coordinate, ne: routeBounds.northeast.coordinate)
         let camera = map.camera(pose, fitting: bounds, edgePadding: padding)
         let zoom = MLNZoomLevelForAltitude(
             camera.altitude, camera.pitch, camera.centerCoordinate.latitude, map.bounds.size
