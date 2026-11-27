@@ -189,14 +189,15 @@ public struct NavigationMapView: View {
             let compoundManeuvers: NavigationManeuverCamera.RouteProgress.CompoundManeuvers?
             if let framing = followCameraConfiguration.maneuverFraming, let outgoingStep, let nextTurn,
                automaticallyAdjustsFollowZoom, distance < framing.distanceRange.upperBound {
-                outgoingPath = NavigationManeuverCamera.routePrefix(
-                    from: nextTurn,
-                    through: outgoingStep.geometry.dropFirst().lazy.map(\.clLocationCoordinate2D),
-                    distance: framing.outgoingDistance
-                )
                 compoundManeuvers = makeCompoundManeuvers(
                     in: steps, from: nextTurn, outgoingStep: outgoingStep, framing: framing
                 )
+                // The compound path already includes the outgoing preview for the second turn.
+                outgoingPath = compoundManeuvers == nil ? NavigationManeuverCamera.routePrefix(
+                    from: nextTurn,
+                    through: outgoingStep.geometry.dropFirst().lazy.map(\.clLocationCoordinate2D),
+                    distance: framing.outgoingDistance
+                ) : []
             } else {
                 outgoingPath = []
                 compoundManeuvers = nil
@@ -265,12 +266,19 @@ public struct NavigationMapView: View {
             )
             if distance >= distanceToTurn {
                 // The full remaining step can be large. Keep only its bounds.
-                lookaheadBounds = .init(
-                    from: origin.coordinate, through: coordinates.compactMap(Turn.init(validating:))
-                )
+                lookaheadBounds = .init(from: origin.coordinate) { visit in
+                    for coordinate in coordinates {
+                        if let point = Turn(validating: coordinate) {
+                            visit(point)
+                        }
+                    }
+                }
             } else {
-                let path = NavigationManeuverCamera.routePrefix(from: origin, through: coordinates, distance: distance)
-                lookaheadBounds = .init(from: origin.coordinate, through: path)
+                lookaheadBounds = .init(from: origin.coordinate) { visit in
+                    NavigationManeuverCamera.visitRoutePrefix(
+                        from: origin, through: coordinates, distance: distance, visit: visit
+                    )
+                }
             }
         } else {
             lookaheadBounds = nil
@@ -286,18 +294,16 @@ public struct NavigationMapView: View {
             maneuverPath = []
         }
 
-        let bearingTarget: Turn?
+        var bearingTarget: Turn?
         if let anticipation = configuration.bearingAnticipation,
            rider.course.isFinite, rider.course >= 0, rider.speed.isFinite, rider.speed >= anticipation.minimumSpeed {
             let afterTurn = hasConnectedTurn && distanceToTurn < anticipation.lookaheadDistance
                 ? outgoing?.dropFirst() ?? []
                 : []
             let bearingCoordinates = [remaining, afterTurn].lazy.joined().map(\.clLocationCoordinate2D)
-            bearingTarget = NavigationManeuverCamera.routePrefix(
+            NavigationManeuverCamera.visitRoutePrefix(
                 from: origin, through: bearingCoordinates, distance: anticipation.lookaheadDistance
-            ).last
-        } else {
-            bearingTarget = nil
+            ) { bearingTarget = $0 }
         }
 
         return .init(lookaheadBounds: lookaheadBounds, maneuverPath: maneuverPath, bearingTarget: bearingTarget)
@@ -329,17 +335,18 @@ public struct NavigationMapView: View {
               routeStepsJoin(outgoingStep.geometry.last?.clLocationCoordinate2D, secondStart)
         else { return nil }
 
-        let pathBetweenTurns = outgoingStep.geometry.compactMap { Turn(validating: $0.clLocationCoordinate2D) }
-        let outgoingPath = NavigationManeuverCamera.routePrefix(
+        var path = outgoingStep.geometry.compactMap { Turn(validating: $0.clLocationCoordinate2D) }
+        path.append(secondTurn)
+        NavigationManeuverCamera.visitRoutePrefix(
             from: secondTurn,
             through: nextStep.geometry.dropFirst().lazy.map(\.clLocationCoordinate2D),
             distance: framing.outgoingDistance
-        )
+        ) { path.append($0) }
         return .init(
             first: firstTurn,
             second: secondTurn,
             stepCountBeforeFirst: steps.count,
-            path: pathBetweenTurns + [secondTurn] + outgoingPath,
+            path: path,
             endsAtRoundaboutExit: throughRoundabout
         )
     }

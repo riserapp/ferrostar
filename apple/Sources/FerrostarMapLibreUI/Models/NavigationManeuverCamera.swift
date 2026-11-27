@@ -93,11 +93,19 @@ final class NavigationManeuverCamera {
         let northeast: RouteProgress.Turn
 
         init?(from location: CLLocationCoordinate2D, through points: some Sequence<RouteProgress.Turn>) {
+            self.init(from: location) { visit in points.forEach(visit) }
+        }
+
+        init?(
+            from location: CLLocationCoordinate2D,
+            sampling points: (_ visit: (RouteProgress.Turn) -> Void) -> Void
+        ) {
             var southwest = location
             var northeast = location
-            for point in points {
+            points { point in
                 // Use the shorter span when the remaining road crosses the antimeridian.
-                let longitude = location.longitude + (point.longitude - location.longitude).remainder(dividingBy: 360)
+                let delta = point.longitude - location.longitude
+                let longitude = location.longitude + (abs(delta) <= 180 ? delta : delta.remainder(dividingBy: 360))
                 southwest.latitude = min(southwest.latitude, point.latitude)
                 northeast.latitude = max(northeast.latitude, point.latitude)
                 southwest.longitude = min(southwest.longitude, longitude)
@@ -138,8 +146,18 @@ final class NavigationManeuverCamera {
         through coordinates: some Sequence<CLLocationCoordinate2D>,
         distance: CLLocationDistance
     ) -> [RouteProgress.Turn] {
-        guard distance > 0 else { return [] }
         var path: [RouteProgress.Turn] = []
+        visitRoutePrefix(from: turn, through: coordinates, distance: distance) { path.append($0) }
+        return path
+    }
+
+    static func visitRoutePrefix(
+        from turn: RouteProgress.Turn,
+        through coordinates: some Sequence<CLLocationCoordinate2D>,
+        distance: CLLocationDistance,
+        visit: (RouteProgress.Turn) -> Void
+    ) {
+        guard distance > 0 else { return }
         var previous = turn
         var previousLocation = CLLocation(latitude: turn.latitude, longitude: turn.longitude)
         var remaining = distance
@@ -149,17 +167,16 @@ final class NavigationManeuverCamera {
             let segment = location.distance(from: previousLocation)
             guard segment.isFinite, segment > 0 else { continue }
             if segment >= remaining {
-                path.append(.init(coordinate: interpolatedCoordinate(
+                visit(.init(coordinate: interpolatedCoordinate(
                     from: previous.coordinate, to: point.coordinate, fraction: remaining / segment
                 )))
                 break
             }
-            path.append(point)
+            visit(point)
             remaining -= segment
             previous = point
             previousLocation = location
         }
-        return path
     }
 
     private func makeCourseArrow() -> CAShapeLayer {
@@ -308,9 +325,16 @@ final class NavigationManeuverCamera {
         let maneuverFit: (center: CLLocationCoordinate2D, zoom: Double)?
         if framingWeight > 0, let framing = configuration.maneuverFraming {
             let padding = framing.viewportPadding
-            let maneuverPath = activeCompound?.path ?? nextTurn + (update.progress?.outgoingPath ?? [])
             maneuverFit = cameraFitting(
-                RouteBounds(from: rider, through: (approach?.maneuverPath ?? []) + maneuverPath),
+                RouteBounds(from: rider) { visit in
+                    approach?.maneuverPath.forEach(visit)
+                    if let activeCompound {
+                        activeCompound.path.forEach(visit)
+                    } else {
+                        nextTurn.forEach(visit)
+                        update.progress?.outgoingPath.forEach(visit)
+                    }
+                },
                 using: pose,
                 on: map,
                 padding: .init(top: padding, left: padding, bottom: padding, right: padding)
